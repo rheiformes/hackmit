@@ -849,6 +849,60 @@ def hackjam_stream(body: HackJamStreamBody):
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
+class RepoJamOnceBody(BaseModel):
+    repoUrl: str
+    tags: Optional[str] = None
+    mood: str = "lock-in"
+    teamName: Optional[str] = None
+    wait: bool = True
+    download: bool = True
+    timeoutSec: int = 180
+
+@app.post("/api/repojam-once")
+def repojam_once(body: RepoJamOnceBody):
+    # 1) Build lyrics from repo
+    repo = fetch_repo_data(body.repoUrl)
+    prompt = build_lyrics(repo["readmeTLDR"], repo["readmeTitle"], repo["commits"])
+
+    mood_tags = (MOOD_MAP.get(body.mood) or MOOD_MAP["lock-in"])["tags"][:3]
+    provided = [t.strip() for t in (body.tags or "").split(",") if t and t.strip()]
+    final_tags = ", ".join(list(dict.fromkeys((provided + mood_tags)))[:6])
+
+    # 2) Generate
+    gen = jfetch(
+        "POST",
+        f"{SUNO_BASE}/generate",
+        headers={"Authorization": f"Bearer {SUNO_TOKEN}", "Content-Type": "application/json"},
+        json={"prompt": prompt, "tags": final_tags},
+    )
+    clip_id = gen.get("id")
+    out = {
+        "clipId": clip_id,
+        "tags": final_tags,
+        "lyricsPreview": prompt[:600],
+        "repoMeta": repo,
+        "titleHint": repo["readmeTitle"] or body.teamName or "HackMIT Track",
+    }
+
+    if body.wait and clip_id:
+        fin = poll_clip(clip_id, target="complete", timeout_sec=body.timeoutSec)
+        out.update({
+            "status": fin.get("status"),
+            "title": fin.get("title"),
+            "image_url": fin.get("image_url"),
+            "audio_url": fin.get("audio_url"),
+            "duration": (fin.get("metadata") or {}).get("duration"),
+        })
+        if body.download and out.get("audio_url", "").endswith(".mp3"):
+            mp3 = requests.get(out["audio_url"], timeout=60)
+            mp3.raise_for_status()
+            os.makedirs("downloads", exist_ok=True)
+            path = os.path.abspath(os.path.join("downloads", f"repojam_{clip_id}.mp3"))
+            with open(path, "wb") as f:
+                f.write(mp3.content)
+            out["saved_path"] = path
+
+    return out
 
 
 # --- local run entrypoint ---
