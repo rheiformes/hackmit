@@ -14,6 +14,10 @@ import pathlib
 import base64
 from urllib.parse import urlencode
 
+import json
+from fastapi.responses import StreamingResponse
+
+
 
 # --- env & constants ---
 load_dotenv()
@@ -430,6 +434,32 @@ def features_from_recommendations(access_token: str, genres: List[str]) -> Dict[
 
 
 
+def poll_clip(clip_id: str, target: str = "complete", timeout_sec: int = 180, interval: float = 2.5) -> dict:
+    """Poll Suno /clips until target status or timeout. Returns the clip object (may be last seen)."""
+    deadline = time.time() + max(5, timeout_sec)
+    last = {}
+    while time.time() < deadline:
+        data = jfetch(
+            "GET",
+            f"{SUNO_BASE}/clips",
+            headers={"Authorization": f"Bearer {SUNO_TOKEN}"},
+            params={"ids": clip_id},
+        )
+        if isinstance(data, list) and data:
+            last = data[0]
+            status = (last.get("status") or "").lower()
+            if status == target:
+                return last
+            # If caller wants streaming URL ASAP
+            if target == "streaming" and status in ("streaming", "complete"):
+                return last
+            # If target is complete and we already got complete, return
+            if target == "complete" and status == "complete":
+                return last
+        time.sleep(interval)
+    return last  # timeout: best-effort return
+
+
 # --- routes ---
 
 @app.post("/api/team-anthem")
@@ -649,6 +679,175 @@ def spotify_recent(body: dict):
     if not access_token:
         raise HTTPException(400, "accessToken required")
     return fetch_recent_genres_and_features(access_token)
+
+
+class HackJamOnceBody(BaseModel):
+    users: List[SpotifyUser]
+    mood: str = "lock-in"
+    teamName: str = "our team"
+    insideJokes: str = ""
+    instrumental: Optional[bool] = None
+    count: int = 1                 # how many tracks to generate
+    wait: bool = True              # wait for final MP3s?
+    download: bool = True          # save MP3s to /downloads
+    timeoutSec: int = 180
+    delayBetweenSec: float = 1.0   # small pacing between requests
+
+@app.post("/api/hackjam-once")
+def hackjam_once(body: HackJamOnceBody):
+    if not body.users:
+        raise HTTPException(400, "At least one Spotify user accessToken is required")
+
+    # 1) Gather per-user taste and fuse into tags/mode
+    per_user = [fetch_spotify_taste(u.accessToken) for u in body.users]
+    fused = fuse_tags(per_user, body.mood, body.instrumental)
+
+    topic_base = f"An anthem for {body.teamName} at HackMIT. Mood: {body.mood}. "
+    if body.insideJokes:
+        topic_base += f"Inside jokes: {body.insideJokes[:120]}"
+    topic_base = topic_base[:480]
+
+    results = []
+    for i in range(max(1, body.count)):
+        # 2) Fire Suno generation
+        gen = jfetch(
+            "POST",
+            f"{SUNO_BASE}/generate",
+            headers={"Authorization": f"Bearer {SUNO_TOKEN}", "Content-Type": "application/json"},
+            json={
+                "topic": (topic_base + f" Track {i+1}").strip()[:480],
+                "tags": fused["tagStr"],
+                "make_instrumental": fused["makeInstrumental"],
+            },
+        )
+        clip_id = gen.get("id")
+        if not clip_id:
+            raise HTTPException(500, "Suno did not return a clip id")
+
+        item = {"clipId": clip_id, "tags": fused["tagStr"], "explain": fused["explain"], "index": i+1}
+
+        if body.wait:
+            # 3) Wait for final and optionally save
+            final = poll_clip(clip_id, target="complete", timeout_sec=body.timeoutSec)
+            item.update({
+                "status": final.get("status"),
+                "title": final.get("title"),
+                "image_url": final.get("image_url"),
+                "audio_url": final.get("audio_url"),
+                "duration": (final.get("metadata") or {}).get("duration"),
+            })
+            if body.download and item.get("audio_url", "").endswith(".mp3"):
+                mp3 = requests.get(item["audio_url"], timeout=60)
+                mp3.raise_for_status()
+                os.makedirs("downloads", exist_ok=True)
+                path = os.path.abspath(os.path.join("downloads", f"hackjam_{clip_id}.mp3"))
+                with open(path, "wb") as f:
+                    f.write(mp3.content)
+                item["saved_path"] = path
+            time.sleep(body.delayBetweenSec)
+        results.append(item)
+
+    return {"count": len(results), "tracks": results, "make_instrumental": fused["makeInstrumental"]}
+
+class HackJamStreamBody(BaseModel):
+    users: List[SpotifyUser]
+    mood: str = "lock-in"
+    teamName: str = "our team"
+    insideJokes: str = ""
+    instrumental: Optional[bool] = None
+    maxTracks: int = 10
+    maxMinutes: int = 15
+    delayBetweenSec: float = 1.0
+    saveEach: bool = False
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+@app.post("/api/hackjam-stream")
+def hackjam_stream(body: HackJamStreamBody):
+    if not body.users:
+        raise HTTPException(400, "At least one Spotify user accessToken is required")
+
+    per_user = [fetch_spotify_taste(u.accessToken) for u in body.users]
+    fused = fuse_tags(per_user, body.mood, body.instrumental)
+    topic_base = f"An anthem for {body.teamName} at HackMIT. Mood: {body.mood}. "
+    if body.insideJokes:
+        topic_base += f"Inside jokes: {body.insideJokes[:120]}"
+    topic_base = topic_base[:480]
+
+    start_time = time.time()
+
+    def gen():
+        # session start
+        yield _sse({"type": "session", "event": "start", "tags": fused["tagStr"], "explain": fused["explain"]})
+        tracks_done = 0
+
+        while tracks_done < max(1, body.maxTracks) and (time.time() - start_time) < body.maxMinutes * 60:
+            # submit a new generation
+            gen = jfetch(
+                "POST",
+                f"{SUNO_BASE}/generate",
+                headers={"Authorization": f"Bearer {SUNO_TOKEN}", "Content-Type": "application/json"},
+                json={
+                    "topic": (topic_base + f" Track {tracks_done+1}").strip()[:480],
+                    "tags": fused["tagStr"],
+                    "make_instrumental": fused["makeInstrumental"],
+                },
+            )
+            clip_id = gen.get("id")
+            if not clip_id:
+                yield _sse({"type": "error", "message": "No clip id from Suno"})
+                break
+
+            yield _sse({"type": "track", "stage": "submitted", "clipId": clip_id, "index": tracks_done+1})
+
+            # get streaming URL asap
+            st = poll_clip(clip_id, target="streaming", timeout_sec=90)
+            if st:
+                yield _sse({
+                    "type": "track",
+                    "stage": "streaming",
+                    "clipId": clip_id,
+                    "index": tracks_done+1,
+                    "stream_url": st.get("audio_url"),
+                    "image_url": st.get("image_url"),
+                    "title": st.get("title") or f"HackJam Track {tracks_done+1}",
+                })
+
+            # wait until complete
+            fin = poll_clip(clip_id, target="complete", timeout_sec=180)
+            payload = {
+                "type": "track",
+                "stage": "complete",
+                "clipId": clip_id,
+                "index": tracks_done+1,
+                "audio_url": fin.get("audio_url"),
+                "title": fin.get("title"),
+                "image_url": fin.get("image_url"),
+                "duration": (fin.get("metadata") or {}).get("duration"),
+            }
+
+            # optional save
+            if body.saveEach and payload.get("audio_url", "").endswith(".mp3"):
+                try:
+                    mp3 = requests.get(payload["audio_url"], timeout=60)
+                    mp3.raise_for_status()
+                    os.makedirs("downloads", exist_ok=True)
+                    path = os.path.abspath(os.path.join("downloads", f"hackjam_{clip_id}.mp3"))
+                    with open(path, "wb") as f:
+                        f.write(mp3.content)
+                    payload["saved_path"] = path
+                except Exception as e:
+                    payload["save_error"] = str(e)
+
+            yield _sse(payload)
+
+            tracks_done += 1
+            time.sleep(max(0.2, body.delayBetweenSec))
+
+        yield _sse({"type": "session", "event": "end", "tracks_done": tracks_done})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 
