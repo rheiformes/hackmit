@@ -1,5 +1,5 @@
 > DEMO: https://www.youtube.com/watch?v=AKqbpe2-a5A 
-> ~~ENDPOINT: https://hackmit-jam.vercel.app/~~ Taken down so I don't run out of credits 💀
+> ENDPOINT: https://hackmit-jam.vercel.app/ (some features might not work bc i ran out of api credits 💀)
 
 <img width="1094" height="555" alt="Screenshot 2025-09-14 at 3 38 22 AM" src="https://github.com/user-attachments/assets/0cef9cf0-c6cd-42ea-8b43-20f5eebd0b92" />
 
